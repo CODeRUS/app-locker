@@ -1,0 +1,444 @@
+diff --git a/usr/share/jolla-settings/pages/devicelock/AppLockPage.qml b/usr/share/jolla-settings/pages/devicelock/AppLockPage.qml
+new file mode 100644
+index 0000000..8c257a8
+--- /dev/null
++++ b/usr/share/jolla-settings/pages/devicelock/AppLockPage.qml
+@@ -0,0 +1,52 @@
++import QtQuick 2.0
++import Sailfish.Silica 1.0
++import Sailfish.Lipstick 1.0
++import com.jolla.settings 1.0
++import org.nemomobile.configuration 1.0
++
++Page {
++    id: page
++
++    ApplicationsGridView {
++        id: gridView
++
++        header: PageHeader {
++            title: "Lock applications"
++        }
++
++        delegate: Item {
++            id: wrapper
++
++            width: appItem.width
++            height: appItem.height
++
++            ConfigurationValue {
++                id: lockConf
++                key: "/desktop/lock/" + encodeURIComponent(model.filePath)
++                defaultValue: false
++            }
++
++            LauncherGridItem {
++                id: appItem
++
++                width: gridView.cellWidth
++                height: gridView.cellHeight
++                icon: model.iconId
++                text: model.name
++                opacity: lockConf.value ? 0.5 : 1.0
++                enabled: model.filePath != "/usr/share/applications/jolla-settings.desktop"
++
++                onClicked: {
++                    lockConf.value = !lockConf.value
++                }
++            }
++
++            Image {
++                anchors.centerIn: parent
++                anchors.verticalCenterOffset: -Theme.paddingSmall
++                source: "image://theme/icon-lock-locked"
++                visible: lockConf.value
++            }
++        }
++    }
++}
+diff --git a/usr/share/jolla-settings/pages/devicelock/devicelock.qml b/usr/share/jolla-settings/pages/devicelock/devicelock.qml
+index d640cde..1b3efb9 100644
+--- a/usr/share/jolla-settings/pages/devicelock/devicelock.qml
++++ b/usr/share/jolla-settings/pages/devicelock/devicelock.qml
+@@ -355,6 +355,16 @@ Page {
+                 }
+             }
+ 
++            ValueButton {
++                label: "Lock applications"
++                visible: deviceLockQuery.lockCodeSet
++                onClicked: {
++                    page.authenticate(function(authenticationToken) {
++                        pageStack.replace(Qt.resolvedUrl("AppLockPage.qml"))
++                    })
++                }
++            }
++
+             Slider {
+                 id: attemptsSlider
+                 value: deviceLockSettings.maximumAttempts != -1 ? deviceLockSettings.maximumAttempts : maximumValue
+diff --git a/usr/share/lipstick-jolla-home-qt5/compositor.qml b/usr/share/lipstick-jolla-home-qt5/compositor.qml
+index 09a8601..0ca8fd0 100644
+--- a/usr/share/lipstick-jolla-home-qt5/compositor.qml
++++ b/usr/share/lipstick-jolla-home-qt5/compositor.qml
+@@ -1396,4 +1396,13 @@ Compositor {
+         anchors.fill: parent
+         sourceComponent: DebugWindow { compositor: root }
+     }
++
++    property var _authenticationTokens: ({})
++
++    Connections {
++        target: root
++        onDisplayOff: {
++            root._authenticationTokens = {}
++        }
++    }
+ }
+diff --git a/usr/share/lipstick-jolla-home-qt5/launcher/LauncherGrid.qml b/usr/share/lipstick-jolla-home-qt5/launcher/LauncherGrid.qml
+index e3999ff..1959188 100644
+--- a/usr/share/lipstick-jolla-home-qt5/launcher/LauncherGrid.qml
++++ b/usr/share/lipstick-jolla-home-qt5/launcher/LauncherGrid.qml
+@@ -198,6 +198,18 @@ SilicaGridView {
+ 
+         scale: newFolderIcon.show && manager.folderIndex == index && !isFolder ? 0.5 : (reordering || manager.folderIndex == index ? 1.3 : 1)
+ 
++        property var lockObserver: observerComponent.createObject(__silica_applicationwindow_instance)
++
++        Component {
++            id: observerComponent
++            LockObserver {}
++        }
++
++        Connections {
++            target: Lipstick.compositor.launcherLayer
++            onActiveChanged: if (!Lipstick.compositor.launcherLayer.active) lockObserver.close()
++        }
++
+         onClicked: {
+             if (dragged) {
+                 return
+@@ -211,6 +223,17 @@ SilicaGridView {
+             } else if (isUpdating || !object.isLaunching) {
+                 // Call launchApplication(), which will send a D-Bus signal
+                 // for interested parties (non-store client) to pick it up
++                if (lockObserver.checkIsLocked(object.filePath)) {
++                    lockObserver.authenticate(object.filePath,
++                    function() {
++                        pageStack.pop()
++                        object.launchApplication()
++                        gridview.itemLaunched()
++                    }, function() {
++                        pageStack.pop()
++                    })
++                    return
++                }
+                 object.launchApplication()
+                 gridview.itemLaunched()
+             } else {
+diff --git a/usr/share/lipstick-jolla-home-qt5/main/AuthorizationQuery.qml b/usr/share/lipstick-jolla-home-qt5/main/AuthorizationQuery.qml
+new file mode 100644
+index 0000000..e8cf127
+--- /dev/null
++++ b/usr/share/lipstick-jolla-home-qt5/main/AuthorizationQuery.qml
+@@ -0,0 +1,131 @@
++import QtQuick 2.0
++import Sailfish.Silica 1.0
++import com.jolla.settings.system 1.0
++import org.nemomobile.devicelock 1.0
++
++QtObject {
++    id: query
++
++    property QtObject _authorization
++    property var _authenticated
++    property var _canceled
++
++    readonly property bool lockCodeSet: deviceLock.availableMethods & Authenticator.LockCode
++
++    function authenticate(authorization, onAuthenticated, onCanceled) {
++        query._authorization = authorization
++        query._authenticated = onAuthenticated
++        query._canceled = onCanceled
++
++        switch (authorization.status) {
++        case Authorization.NoChallenge:
++            authorization.requestChallenge()
++            break
++        case Authorization.ChallengeIssued:
++            _handleChallenge()
++            break
++        default:
++            break
++        }
++    }
++
++    function _handleChallenge() {
++        if (deviceLock.availableMethods !== 0) {
++            pageStack.push(inputPage)
++        } else {
++            // No lock code is set so don't display the UI, but authenticate anyway to acquire
++            // an authentication token for the challenge code.
++            deviceLock.authenticate(query._authorization.challengeCode)
++        }
++    }
++
++    property list<QtObject> _data: [
++        Authenticator {
++            id: deviceLock
++
++            onAuthenticated: {
++                var authenticated = query._authenticated
++                query._authenticated = undefined
++                query._canceled = undefined
++
++                authenticated(authenticationToken)
++            }
++        },
++
++        Connections {
++            target: query._authorization
++
++            onChallengeIssued: query._handleChallenge()
++            onChallengeDeclined: {
++                var canceled = query._canceled
++                query._authenticated = undefined
++                query._canceled = undefined
++                query._authorization = null
++
++                if (_canceled) {
++                    _canceled()
++                }
++            }
++        },
++
++        Component {
++            id: inputPage
++
++            Page {
++                id: page
++
++                property QtObject authorization
++
++                backNavigation: false
++                opacity: status === PageStatus.Active ? 1.0 : 0.0
++
++                onStatusChanged: {
++                    if (status == PageStatus.Active) {
++                        deviceLock.authenticate(
++                                    query._authorization.challengeCode,
++                                    query._authorization.allowedMethods)
++                    } else if (deviceLock.authenticating) {
++                        deviceLock.cancel()
++                    }
++                }
++
++                Rectangle {
++                    anchors.fill: parent
++                    color: "black"
++                }
++
++                DeviceLockInput {
++                    id: devicelockinput
++
++                    authenticator: deviceLock
++
++                    //% "Confirm with lock code"
++                    titleText: qsTrId("settings_devicelock-he-lock_code_confirm_title")
++                    //% "Confirm"
++                    okText: qsTrId("settings_devicelock-bt-devicelock_confirm")
++
++                    showEmergencyButton: false
++
++                    onPinEntryCanceled: {
++                        var canceled = query._canceled
++                        var authorization = query._authorization
++                        query._authenticated = undefined
++                        query._canceled = undefined
++                        query._authorization = null
++
++                        clear()
++
++                        authorization.relinquishChallenge()
++                        if (canceled) {
++                            canceled()
++                        } else {
++                            pageStack.pop()
++                        }
++                    }
++
++                    onPinConfirmed: deviceLock.enterLockCode(enteredPin)
++                }
++            }
++        }
++    ]
++}
+diff --git a/usr/share/lipstick-jolla-home-qt5/main/LockObserver.qml b/usr/share/lipstick-jolla-home-qt5/main/LockObserver.qml
+new file mode 100644
+index 0000000..c0b59e3
+--- /dev/null
++++ b/usr/share/lipstick-jolla-home-qt5/main/LockObserver.qml
+@@ -0,0 +1,78 @@
++import QtQuick 2.0
++import Sailfish.Silica 1.0
++import Sailfish.Silica.private 1.0
++import org.nemomobile.lipstick 0.1
++import com.jolla.settings.system 1.0
++import org.nemomobile.devicelock 1.0
++
++QtObject {
++    id: lockObserver
++
++    readonly property bool lockCodeSet: deviceLockQuery.lockCodeSet
++    signal displayWasOff
++
++    function checkIsLocked(desktop) {
++        if (!lockObserver.lockCodeSet) {
++            return false
++        }
++        var conf = Qt.createQmlObject("import org.nemomobile.configuration 1.0; ConfigurationValue { key: \"/desktop/lock/\" + encodeURIComponent(\"%1\"); defaultValue: false }".arg(desktop), dummyParent, "lockConf")
++        if (!conf) {
++            return false
++        }
++        var result = conf.value
++        conf.destroy()
++        return conf.value
++    }
++
++    function authenticate(desktop, onAuthenticated, onCanceled) {
++        if (Lipstick.compositor._authenticationTokens[desktop]) {
++            onAuthenticated(Lipstick.compositor._authenticationTokens[desktop])
++        } else {
++            deviceLockQuery.authenticate(deviceLockSettings.authorization, function(authenticationToken) {
++                Lipstick.compositor._authenticationTokens[desktop] = authenticationToken
++                onAuthenticated(authenticationToken)
++            }, onCanceled)
++        }
++    }
++
++    function close() {
++        if (pageStack.currentPage.hasOwnProperty("authorization") && !pageStack.busy) {
++            pageStack.pop()
++        }
++    }
++
++    property list<QtObject> _data: [
++        QtObject {
++            id: dummyParent
++        },
++
++        DeviceLockSettings {
++            id: deviceLockSettings
++        },
++
++        FingerprintSettings {
++            id: fingerprintSettings
++        },
++
++        AuthorizationQuery {
++            id: deviceLockQuery
++        },
++
++        WindowGestureOverride {
++            active: fingerprintSettings.acquiring
++        },
++
++        Connections {
++            target: Lipstick.compositor
++            onDisplayOff: {
++                fingerprintSettings.cancelAcquisition()
++                fingerprintSettings.authorization.relinquishChallenge()
++
++                deviceLockSettings.authorization.relinquishChallenge()
++
++                close()
++                lockObserver.displayWasOff()
++            }
++        }
++    ]
++}
+diff --git a/usr/share/lipstick-jolla-home-qt5/switcher/Switcher.qml b/usr/share/lipstick-jolla-home-qt5/switcher/Switcher.qml
+index 86a9624..fc527ba 100644
+--- a/usr/share/lipstick-jolla-home-qt5/switcher/Switcher.qml
++++ b/usr/share/lipstick-jolla-home-qt5/switcher/Switcher.qml
+@@ -472,7 +472,57 @@ SilicaFlickable {
+ 
+                     processId: model.processId
+ 
++                    property var lockObserver: observerComponent.createObject(__silica_applicationwindow_instance)
++
++                    Component {
++                        id: observerComponent
++                        LockObserver {
++                            onDisplayWasOff: {
++                                if (lockObserver.checkIsLocked(launcherItem.filePath)) {
++                                    switcherDelegate.authenticated = false
++                                }
++                            }
++                        }
++                    }
++
++                    Connections {
++                        target: switcherRoot
++                        onSwitcherVisibleChanged: {
++                            if (!switcherRoot.switcherVisible) {
++                                lockObserver.close()
++                            }
++                        }
++                    }
++
+                     onClicked: {
++                        if (lockObserver.checkIsLocked(launcherItem.filePath)) {
++                            authenticated = false
++                            lockObserver.authenticate(launcherItem.filePath,
++                            function() {
++                                pageStack.pop()
++                                authenticated = true
++                                if (switcherRoot.closeApplicationEnabled) {
++                                    switcherRoot.closeApplicationEnabled = false;
++                                } else if (running) {
++                                    switcherRoot.minimizeLaunchingWindows()
++                                    minimized = false
++                                    Lipstick.compositor.windowToFront(windowId)
++                                } else if (launcherItem) {
++                                    switcherRoot.minimizeLaunchingWindows()
++                                    // App is not running. Launch it now.
++                                    launching = true
++                                    minimized = false
++                                    switcherRoot.launchingItem = switcherDelegate
++                                    launcherItem.launchApplication()
++                                }
++                            }, function() {
++                                pageStack.pop()
++                            })
++                            return
++                        }
++                        if (!authenticated) {
++                            return
++                        }
+                         if (switcherRoot.closeApplicationEnabled) {
+                             switcherRoot.closeApplicationEnabled = false;
+                         } else if (running) {
+diff --git a/usr/share/lipstick-jolla-home-qt5/switcher/SwitcherItem.qml b/usr/share/lipstick-jolla-home-qt5/switcher/SwitcherItem.qml
+index b6c281a..af839fa 100644
+--- a/usr/share/lipstick-jolla-home-qt5/switcher/SwitcherItem.qml
++++ b/usr/share/lipstick-jolla-home-qt5/switcher/SwitcherItem.qml
+@@ -139,7 +139,8 @@ EditableGridDelegate {
+         }
+     }
+ 
+-    property bool hideCover: wrapper.launching || startupTimer.running || !windowPixmap.hasPixmap
++    property bool authenticated: true
++    property bool hideCover: wrapper.launching || startupTimer.running || !windowPixmap.hasPixmap || !authenticated
+     property real coverOpacity: hideCover ? 0.0 : (!running ? 0.6 : 1.0)
+ 
+     CoverActionModel {
+@@ -195,7 +196,7 @@ EditableGridDelegate {
+         size: Theme.iconSizeMedium
+         anchors.centerIn: parent
+         scale: parent.width/Theme.coverSizeLarge.width
+-        icon: launcherItem ? launcherItem.iconId : ""
++        icon: authenticated ? launcherItem ? launcherItem.iconId : "" : "image://theme/icon-lock-locked"
+         layer.effect: null
+         opacity: hideCover ? 1.0 : 0.0
+         Behavior on opacity { FadeAnimation { duration: 500 } }
